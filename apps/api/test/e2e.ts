@@ -25,6 +25,7 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
 interface User { id: number; name: string; role: string; stellar_address: string; balance: string | null }
 interface Listing { id: number; slug: string; title: string; host_id: number }
 interface Booking { id: number; status: string; chain_check_in: string; chain_deadline: string; ledgerTime: number; amount_token: string; fee_token: string; deposit_token: string; chain: { status: string } | null }
+interface LinkBooking { id: number; reference: string }
 
 const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
 const users = await call<User[]>('/users');
@@ -49,6 +50,22 @@ async function waitLedger(id: number, field: 'chain_check_in' | 'chain_deadline'
 // Book everything first so the waits overlap.
 const g0 = await bal(guest.id);
 const cab = by('cabana-amatlan'), loft = by('loft-centro'), atongo = by('casa-atongo'), tepoz = by('casa-tepozteco');
+
+// Two simultaneous attempts on one offer must serialize to exactly one booking.
+{
+  const checkIn = day(8), checkOut = day(9);
+  const offer = await call<{ code: string }>('/offers', { listingId: cab.id, hostId: cab.host_id, checkIn, checkOut, guests: 2 });
+  const attempt = () => call<LinkBooking>('/bookings', { listingId: cab.id, guestId: guest.id, checkIn, checkOut, guests: 2, offerCode: offer.code });
+  const results = await Promise.all([attempt(), attempt()].map((p) => p.then(
+    (booking) => ({ ok: true as const, booking }),
+    (error: Error) => ({ ok: false as const, error }),
+  )));
+  const winners = results.filter((r) => r.ok);
+  check(winners.length === 1, 'simultaneous attempts on one payment link create exactly one booking');
+  const state = await call<{ status: string }>('/offers/' + offer.code);
+  check(state.status === 'used', 'used payment link cannot be booked again');
+}
+
 const b1 = await book(cab, 3, 2);
 const b2 = await book(loft, 1, 1);
 const b3 = await book(atongo, 1, 1);

@@ -2,11 +2,12 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { Horizon, Keypair } from '@stellar/stellar-sdk';
 import { act, BookingError, createBooking, EscrowError, isAvailable } from './bookings.js';
-import { DAY_SECS, FEE_RATE, HORIZON_URL, loadKeys, PG_DIR, STAY_HOLD_DAYS } from './config.js';
+import { CLAIM_DAYS, DAY_SECS, FEE_RATE, HORIZON_URL, loadKeys, OFFER_HOURS, PG_DIR, STAY_HOLD_DAYS } from './config.js';
 import { openDb } from './db.js';
 import { explorerContract, explorerTx, getBooking, ledgerTime } from './escrow.js';
 import { usdcMxnRate } from './fx.js';
 import { nightsBetween, POLICIES, quote } from './quote.js';
+import { createOffer } from './offers.js';
 
 const db = await openDb(PG_DIR);
 const app = Fastify({ logger: false });
@@ -35,7 +36,7 @@ app.get('/api/config', async () => {
   const fx = await usdcMxnRate().catch(() => null);
   return {
     contractId: keys.contractId, contractExplorer: explorerContract(keys.contractId), asset: keys.asset,
-    daySecs: DAY_SECS, feeRate: FEE_RATE, stayHoldDays: STAY_HOLD_DAYS, fx, policies: POLICIES,
+    daySecs: DAY_SECS, feeRate: FEE_RATE, offerHours: OFFER_HOURS, stayHoldDays: STAY_HOLD_DAYS, claimDays: CLAIM_DAYS, fx, policies: POLICIES,
     arbiter: Keypair.fromSecret(keys.arbiter).publicKey(), platform: Keypair.fromSecret(keys.platform).publicKey(),
   };
 });
@@ -46,17 +47,26 @@ app.get('/api/users', async () => {
 });
 
 app.get('/api/listings', async () =>
-  (await db.query(`SELECT l.*, u.name AS host_name FROM listings l JOIN users u ON u.id = l.host_id ORDER BY l.id`)).rows);
+  (await db.query(`SELECT l.*, u.name AS host_name FROM listings l JOIN users u ON u.id = l.host_id WHERE l.unlisted = FALSE ORDER BY l.id`)).rows);
+
+app.get<{ Params: { hostId: string } }>('/api/hosts/:hostId/listings', async (req, reply) => {
+  const hostId = Number(req.params.hostId);
+  const host = (await db.query(`SELECT id FROM users WHERE id = $1 AND role = 'host'`, [hostId])).rows[0];
+  if (!host) return reply.status(404).send({ error: 'Host not found' });
+  return (await db.query(`SELECT * FROM listings WHERE host_id = $1 ORDER BY id`, [hostId])).rows;
+});
 
 app.get<{ Params: { slug: string } }>('/api/listings/:slug', async (req, reply) => {
-  const l = (await db.query(`SELECT l.*, u.name AS host_name, u.bio AS host_bio, u.stellar_address AS host_address FROM listings l JOIN users u ON u.id = l.host_id WHERE l.slug = $1`, [req.params.slug])).rows[0];
+  const l = (await db.query(`SELECT l.*, u.name AS host_name, u.bio AS host_bio, u.stellar_address AS host_address FROM listings l JOIN users u ON u.id = l.host_id WHERE l.slug = $1 AND l.unlisted = FALSE`, [req.params.slug])).rows[0];
   if (!l) return reply.status(404).send({ error: 'Listing not found' });
-  const booked = (await db.query(`SELECT check_in::text, check_out::text FROM bookings WHERE listing_id = $1 AND status IN ('locked','disputed','stay_paid','released','resolved') ORDER BY check_in`, [(l as { id: number }).id])).rows;
+  const booked = (await db.query(`SELECT check_in::text, check_out::text FROM bookings WHERE listing_id = $1 AND status IN ('locked','disputed','stay_paid','released','resolved')
+    UNION ALL SELECT check_in::text, check_out::text FROM rental_offers WHERE listing_id = $1 AND status = 'open' AND expires_at > NOW()
+    ORDER BY check_in`, [(l as { id: number }).id])).rows;
   return { ...l, booked };
 });
 
 app.get<{ Querystring: { listingId: string; checkIn: string; checkOut: string } }>('/api/quote', async (req) => {
-  const l = (await db.query<{ id: number; nightly_mxn: string; cleaning_mxn: string; deposit_mxn: string }>(`SELECT * FROM listings WHERE id = $1`, [Number(req.query.listingId)])).rows[0];
+  const l = (await db.query<{ id: number; nightly_mxn: string; cleaning_mxn: string; deposit_mxn: string }>(`SELECT * FROM listings WHERE id = $1 AND unlisted = FALSE`, [Number(req.query.listingId)])).rows[0];
   if (!l) throw new BookingError('Listing not found');
   const nights = nightsBetween(req.query.checkIn, req.query.checkOut);
   if (!(nights >= 1 && nights <= 30)) throw new BookingError('A stay is 1 to 30 nights');
@@ -64,7 +74,48 @@ app.get<{ Querystring: { listingId: string; checkIn: string; checkOut: string } 
   return { ...quote(l, nights), available: await isAvailable(db, l.id, req.query.checkIn, req.query.checkOut), fx };
 });
 
-app.post<{ Body: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number } }>('/api/bookings', async (req) => createBooking(db, req.body));
+app.post<{ Body: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number; offerCode?: string } }>('/api/bookings', async (req) =>
+  db.transaction(async (tx) => {
+    await tx.query(`SELECT id FROM listings WHERE id = $1 FOR UPDATE`, [req.body.listingId]);
+    return createBooking(tx, req.body);
+  }));
+
+app.post<{ Body: { listingId: number; hostId: number; checkIn: string; checkOut: string; guests: number } }>('/api/offers', async (req) =>
+  db.transaction((tx) => createOffer(tx, req.body, OFFER_HOURS, DAY_SECS)));
+
+app.get<{ Params: { code: string } }>('/api/offers/:code', async (req, reply) => {
+  if (!/^[A-Za-z0-9_-]{16,32}$/.test(req.params.code)) return reply.status(404).send({ error: 'Payment link not found' });
+  const offer = (await db.query(`SELECT o.*, l.slug, l.title, l.area, l.cover, l.max_guests, l.amenities,
+      u.name AS host_name, u.stellar_address AS host_address
+    FROM rental_offers o JOIN listings l ON l.id = o.listing_id JOIN users u ON u.id = o.host_id WHERE o.code = $1`, [req.params.code])).rows[0] as Record<string, unknown> | undefined;
+  if (!offer) return reply.status(404).send({ error: 'Payment link not found' });
+  const expired = offer.status === 'open' && new Date(String(offer.expires_at)).getTime() <= Date.now();
+  return { ...offer, status: expired ? 'expired' : offer.status, contractId: loadKeys().contractId };
+});
+
+app.get<{ Params: { hostId: string } }>('/api/hosts/:hostId/offers', async (req, reply) => {
+  const hostId = Number(req.params.hostId);
+  const host = (await db.query(`SELECT id FROM users WHERE id = $1 AND role = 'host'`, [hostId])).rows[0];
+  if (!host) return reply.status(404).send({ error: 'Host not found' });
+  const offers = (await db.query(`SELECT o.*, l.title, l.slug FROM rental_offers o JOIN listings l ON l.id = o.listing_id WHERE o.host_id = $1 ORDER BY o.created_at DESC`, [hostId])).rows as Array<Record<string, unknown>>;
+  return offers.map((offer) => ({
+    ...offer,
+    status: offer.status === 'open' && new Date(String(offer.expires_at)).getTime() <= Date.now() ? 'expired' : offer.status,
+  }));
+});
+
+app.post<{ Params: { code: string }; Body: { hostId: number } }>('/api/offers/:code/cancel', async (req, reply) => {
+  const result = await db.query(`UPDATE rental_offers SET status = 'cancelled'
+    WHERE code = $1 AND host_id = $2 AND status = 'open' AND expires_at > NOW() RETURNING code`, [req.params.code, req.body.hostId]);
+  if (result.rows.length !== 1) return reply.status(404).send({ error: 'Open payment link not found for this host' });
+  return { status: 'cancelled' };
+});
+
+app.post<{ Params: { id: string }; Body: { hostId: number; unlisted: boolean } }>('/api/listings/:id/unlisted', async (req, reply) => {
+  const result = await db.query(`UPDATE listings SET unlisted = $1 WHERE id = $2 AND host_id = $3 RETURNING id`, [req.body.unlisted, Number(req.params.id), req.body.hostId]);
+  if (result.rows.length !== 1) return reply.status(404).send({ error: 'Listing not found for this host' });
+  return { unlisted: req.body.unlisted };
+});
 
 const BOOKING_SQL = `
   SELECT b.*, b.check_in::text AS check_in, b.check_out::text AS check_out, l.title, l.slug, l.area, l.cover,

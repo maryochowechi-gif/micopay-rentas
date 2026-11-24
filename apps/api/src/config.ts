@@ -24,6 +24,9 @@ export const CLAIM_DAYS = 2;
 /** Calendar days after check-in before the host's stay payment can be released. */
 export const STAY_HOLD_DAYS = Number(process.env.STAY_HOLD_DAYS ?? 1);
 
+/** Default lifetime of a host-created payment link; scaled by the demo day length. */
+export const OFFER_HOURS = Number(process.env.OFFER_HOURS ?? 24);
+
 /** Testnet-only keys written by the seed. Never real funds. */
 export interface TestnetKeys {
   contractId: string;

@@ -150,7 +150,7 @@ export default function BookingPage({ onChange }: { onChange: () => void }) {
             {phase === 'before' && <Button variant="peligro" block className="mt-3" disabled={!!busy} onClick={() => run('host-cancel')}>{busy === 'host-cancel' ? 'Cancelling…' : 'Cancel and refund the guest in full'}</Button>}
           </Panel>
         )}
-        {open && b.status === 'locked' && ledger >= stayPaidAt && (
+        {open && b.status === 'locked' && ledger >= stayPaidAt && phase !== 'after' && (
           <Panel title="Stay payment">
             <p className="text-[15px]">The stay hold has ended. The host can now be paid; the deposit remains in escrow through the claims window.</p>
             <Button block className="mt-3" disabled={!!busy} onClick={() => run('pay-stay')}>{busy === 'pay-stay' ? 'Paying the host…' : 'Pay the host'}</Button>
