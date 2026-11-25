@@ -4,6 +4,7 @@ import { DAY_SECS, STAY_HOLD_DAYS } from './config.js';
 
 /** Local development on PGlite (Postgres in WASM). Plain Postgres SQL, so it moves to AWS as is. */
 export type Db = PGlite;
+export type Queryable = Pick<Db, 'query'>;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -29,7 +30,8 @@ CREATE TABLE IF NOT EXISTS listings (
   bedrooms      INT NOT NULL,
   policy        TEXT NOT NULL CHECK (policy IN ('flexible', 'moderate', 'strict')),
   amenities     JSONB NOT NULL DEFAULT '[]',
-  cover         INT NOT NULL DEFAULT 0
+  cover         INT NOT NULL DEFAULT 0,
+  unlisted      BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS bookings (
@@ -70,12 +72,35 @@ CREATE TABLE IF NOT EXISTS booking_events (
   details     JSONB NOT NULL DEFAULT '{}',
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS rental_offers (
+  code          VARCHAR(32) PRIMARY KEY,
+  listing_id    INT NOT NULL REFERENCES listings(id),
+  host_id       INT NOT NULL REFERENCES users(id),
+  check_in      DATE NOT NULL,
+  check_out     DATE NOT NULL,
+  nights        INT NOT NULL,
+  guests        INT NOT NULL,
+  nightly_mxn   NUMERIC(12,2) NOT NULL,
+  cleaning_mxn  NUMERIC(12,2) NOT NULL,
+  subtotal_mxn  NUMERIC(12,2) NOT NULL,
+  fee_mxn       NUMERIC(12,2) NOT NULL,
+  deposit_mxn   NUMERIC(12,2) NOT NULL,
+  total_mxn     NUMERIC(12,2) NOT NULL,
+  policy        TEXT NOT NULL CHECK (policy IN ('flexible', 'moderate', 'strict')),
+  tiers         JSONB NOT NULL,
+  status        TEXT NOT NULL CHECK (status IN ('open', 'used', 'cancelled')),
+  expires_at    TIMESTAMPTZ NOT NULL,
+  booking_id    INT REFERENCES bookings(id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `;
 
 export async function openDb(dir: string): Promise<Db> {
   mkdirSync(dir, { recursive: true });
   const db = new PGlite(dir);
   await db.exec(SCHEMA);
+  await db.exec(`ALTER TABLE listings ADD COLUMN IF NOT EXISTS unlisted BOOLEAN NOT NULL DEFAULT FALSE`);
   await db.exec(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS chain_stay_paid_at BIGINT`);
   await db.query(`UPDATE bookings SET chain_stay_paid_at = chain_check_in + $1 WHERE chain_stay_paid_at IS NULL`, [STAY_HOLD_DAYS * DAY_SECS]);
   await db.exec(`ALTER TABLE bookings ALTER COLUMN chain_stay_paid_at SET NOT NULL`);

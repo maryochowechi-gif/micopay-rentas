@@ -59,6 +59,18 @@ cd contracts/escrow-v2 && cargo test
 
 **Signing.** In the demo, guests and hosts sign with local testnet keys. In production they approve in the MicoPay app (`/sign-requests`), the same path as MicoPay Café.
 
+## Host payment links
+
+1. Start the API and web app, choose a host persona, then open **Hosting**.
+2. Select a listing, check-in/out dates and guest count; create and copy the link, or open the WhatsApp share link.
+3. Switch to a guest persona, open `/r/<code>`, check the frozen price and payment timeline, then book. The booking appears in Trips and the host's Hosting.
+4. Open the same link again to verify its used state has no payment action. While it is open, its dates are unavailable to quotes, public listing bookings and other links. A host can cancel an open link; changing a listing to unlisted hides it from Home but does not disable links.
+5. On the link page, tab through the controls and actions and confirm focus is visible. Check screenshots at 360×640 and 375 px wide for the open, used and expired states, and capture the host's payment-link list.
+
+The database additions are `listings.unlisted`, `bookings.chain_stay_paid_at`, and the `rental_offers` table (`code`, listing/host, stay dates/guest count, frozen MXN quote, policy/tiers, status, expiry, optional booking id and creation time). New API routes are `GET /api/hosts/:hostId/listings`, `POST /api/offers`, `GET /api/offers/:code`, `GET /api/hosts/:hostId/offers`, `POST /api/offers/:code/cancel`, and `POST /api/listings/:id/unlisted`. `POST /api/bookings` accepts `offerCode`; booking actions include `POST /api/bookings/:id/pay-stay`.
+
+To exercise the atomic one-link/one-booking rule on testnet, run the API with the deployed RENT-6 contract and seeded accounts, then run `npx tsx apps/api/test/e2e.ts`. The e2e check sends two concurrent booking requests for the same payment link and requires exactly one success.
+
 ## Stack
 
 TypeScript monorepo, Fastify API, Postgres (PGlite locally), React + Vite + Tailwind with the MicoPay app's design tokens, Stellar SDK (Soroban RPC + Horizon).

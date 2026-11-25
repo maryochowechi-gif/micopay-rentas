@@ -1,6 +1,7 @@
 export interface Config {
   contractId: string; contractExplorer: string; asset: { code: string; issuer: string };
-  daySecs: number; feeRate: string; stayHoldDays: number; fx: { rate: string; source: string } | null; arbiter: string; platform: string;
+  daySecs: number; feeRate: string; offerHours: number; stayHoldDays: number; claimDays: number;
+  fx: { rate: string; source: string } | null; arbiter: string; platform: string;
   policies: Record<Policy, { label: string; tiers: Array<{ days: number; refundPct: number }> }>;
 }
 export type Policy = 'flexible' | 'moderate' | 'strict';
@@ -8,7 +9,7 @@ export interface User { id: number; name: string; role: 'host' | 'guest'; stella
 export interface Listing {
   id: number; host_id: number; slug: string; title: string; area: string; summary: string; description: string;
   nightly_mxn: string; cleaning_mxn: string; deposit_mxn: string; max_guests: number; bedrooms: number; policy: Policy;
-  amenities: string[]; cover: number; host_name: string; host_bio?: string; host_address?: string;
+  amenities: string[]; cover: number; unlisted: boolean; host_name: string; host_bio?: string; host_address?: string;
   booked?: Array<{ check_in: string; check_out: string }>;
 }
 export interface Quote {
@@ -29,6 +30,17 @@ export interface ChainBooking { amount: string; fee: string; deposit: string; ch
 export interface BookingEvent { id: number; kind: string; actor: string; tx_hash: string | null; explorer: string | null; details: Record<string, unknown>; created_at: string }
 export interface BookingDetail extends Booking { chain: ChainBooking | null; ledgerTime: number; events: BookingEvent[] }
 export interface TxResult { txHash: string; explorer: string; status: Status | null }
+export interface Offer {
+  code: string; listing_id: number; host_id: number; title: string; slug: string; area: string; cover: number;
+  host_name: string; host_address: string; check_in: string; check_out: string; nights: number; guests: number;
+  nightly_mxn: string; cleaning_mxn: string; subtotal_mxn: string; fee_mxn: string; deposit_mxn: string; total_mxn: string;
+  policy: Policy; tiers: Array<{ min_secs_before: number; refund_bps: number }>; status: 'open' | 'used' | 'expired' | 'cancelled';
+  expires_at: string; booking_id: number | null; contractId: string;
+}
+export interface OfferSummary {
+  code: string; title: string; slug: string; check_in: string; check_out: string; guests: number;
+  total_mxn: string; status: Offer['status']; expires_at: string;
+}
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, body === undefined ? undefined : {
@@ -48,10 +60,18 @@ export const api = {
   config: () => call<Config>('/config'),
   users: () => call<User[]>('/users'),
   listings: () => call<Listing[]>('/listings'),
+  hostListings: (hostId: number) => call<Listing[]>(`/hosts/${hostId}/listings`),
   listing: (slug: string) => call<Listing>(`/listings/${slug}`),
   quote: (listingId: number, checkIn: string, checkOut: string) => call<Quote>(`/quote${qs({ listingId, checkIn, checkOut })}`),
-  book: (b: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number }) =>
+  book: (b: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number; offerCode?: string }) =>
     call<{ id: number; reference: string; txHash: string; explorer: string }>('/bookings', b),
+  createOffer: (offer: { listingId: number; hostId: number; checkIn: string; checkOut: string; guests: number }) =>
+    call<{ code: string; expires_at: string }>('/offers', offer),
+  offer: (code: string) => call<Offer>(`/offers/${code}`),
+  offers: (hostId: number) => call<OfferSummary[]>(`/hosts/${hostId}/offers`),
+  cancelOffer: (code: string, hostId: number) => call<{ status: string }>(`/offers/${code}/cancel`, { hostId }),
+  setUnlisted: (listingId: number, hostId: number, unlisted: boolean) =>
+    call<{ unlisted: boolean }>(`/listings/${listingId}/unlisted`, { hostId, unlisted }),
   bookings: (f: { guestId?: number; hostId?: number; status?: string }) => call<Booking[]>(`/bookings${qs(f)}`),
   booking: (id: number) => call<BookingDetail>(`/bookings/${id}`),
   act: (id: number, action: string, body: object = {}) => call<TxResult>(`/bookings/${id}/${action}`, body),

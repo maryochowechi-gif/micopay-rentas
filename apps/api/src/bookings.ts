@@ -2,7 +2,7 @@ import Big from 'big.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { loadKeys } from './config.js';
-import type { Db } from './db.js';
+import type { Db, Queryable } from './db.js';
 import { EscrowError, explorerTx, getBooking, invoke, sv, toStroops, type ChainBooking } from './escrow.js';
 import { usdcMxnRate, toToken } from './fx.js';
 import { chainTiers, chainTimes, nightsBetween, quote, type Policy } from './quote.js';
@@ -11,21 +11,27 @@ export class BookingError extends Error {}
 
 const ACTIVE = `('locked', 'stay_paid', 'disputed', 'released', 'resolved')`;
 
-export async function isAvailable(db: Db, listingId: number, checkIn: string, checkOut: string): Promise<boolean> {
+export async function isAvailable(db: Queryable, listingId: number, checkIn: string, checkOut: string, excludeOfferCode?: string): Promise<boolean> {
   const r = await db.query(
-    `SELECT 1 FROM bookings WHERE listing_id = $1 AND status IN ${ACTIVE} AND check_in < $3 AND check_out > $2 LIMIT 1`,
-    [listingId, checkIn, checkOut],
+    `SELECT 1 FROM bookings
+       WHERE listing_id = $1 AND status IN ${ACTIVE} AND check_in < $3 AND check_out > $2
+     UNION ALL
+     SELECT 1 FROM rental_offers
+       WHERE listing_id = $1 AND status = 'open' AND expires_at > NOW()
+         AND check_in < $3 AND check_out > $2 AND ($4::text IS NULL OR code <> $4)
+     LIMIT 1`,
+    [listingId, checkIn, checkOut, excludeOfferCode ?? null],
   );
   return r.rows.length === 0;
 }
 
-async function nextReference(db: Db): Promise<string> {
+async function nextReference(db: Queryable): Promise<string> {
   const year = new Date().getFullYear();
   const r = await db.query<{ n: number }>(`SELECT COUNT(*)::int + 1 AS n FROM bookings`);
   return `TPZ-${year}-${String(r.rows[0]!.n).padStart(5, '0')}`;
 }
 
-async function event(db: Db, bookingId: number, kind: string, actor: string, txHash: string | null, details: object = {}) {
+async function event(db: Queryable, bookingId: number, kind: string, actor: string, txHash: string | null, details: object = {}) {
   await db.query(`INSERT INTO booking_events (booking_id, kind, actor, tx_hash, details) VALUES ($1, $2, $3, $4, $5)`,
     [bookingId, kind, actor, txHash, JSON.stringify(details)]);
 }
@@ -40,24 +46,50 @@ function signerFor(address: string): Keypair {
  * Quote → escrow. The escrow id is SHA-256 of the booking terms plus a random salt, so the
  * on-chain record points at exactly what was agreed and can't be guessed in advance.
  */
-export async function createBooking(db: Db, input: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number }) {
-  const l = (await db.query<{ id: number; slug: string; nightly_mxn: string; cleaning_mxn: string; deposit_mxn: string; max_guests: number; policy: Policy; host_address: string }>(
+export async function createBooking(db: Queryable, input: { listingId: number; guestId: number; checkIn: string; checkOut: string; guests: number; offerCode?: string }) {
+  const l = (await db.query<{ id: number; slug: string; nightly_mxn: string; cleaning_mxn: string; deposit_mxn: string; max_guests: number; policy: Policy; host_address: string; unlisted: boolean }>(
     `SELECT l.*, u.stellar_address AS host_address FROM listings l JOIN users u ON u.id = l.host_id WHERE l.id = $1`, [input.listingId],
   )).rows[0];
   if (!l) throw new BookingError('Listing not found');
+  if (l.unlisted && !input.offerCode) throw new BookingError('This listing can only be booked through its payment link');
   const guest = (await db.query<{ id: number; stellar_address: string }>(`SELECT id, stellar_address FROM users WHERE id = $1 AND role = 'guest'`, [input.guestId])).rows[0];
   if (!guest) throw new BookingError('Guest not found');
+  if (guest.stellar_address === l.host_address) throw new BookingError('A host cannot pay their own link');
   const nights = nightsBetween(input.checkIn, input.checkOut);
   if (!(nights >= 1 && nights <= 30)) throw new BookingError('A stay is 1 to 30 nights');
   if (input.guests < 1 || input.guests > l.max_guests) throw new BookingError(`This place takes up to ${l.max_guests} guests`);
   const times = chainTimes(input.checkIn, input.checkOut);
   if (times.checkInSec <= Date.now() / 1000 + 30) throw new BookingError('Check-in must be in the future');
-  if (!(await isAvailable(db, l.id, input.checkIn, input.checkOut))) throw new BookingError('Those dates are already booked');
+  let offer: {
+    code: string; nights: number; guests: number; check_in: string; check_out: string;
+    nightly_mxn: string; cleaning_mxn: string; subtotal_mxn: string; fee_mxn: string; deposit_mxn: string; total_mxn: string;
+    policy: Policy; tiers: Array<{ min_secs_before: number; refund_bps: number }>; status: string; expires_at: string | Date;
+  } | undefined;
+  if (input.offerCode) {
+    offer = (await db.query<NonNullable<typeof offer>>(
+      `SELECT *, check_in::text AS check_in, check_out::text AS check_out FROM rental_offers
+       WHERE code = $1 AND listing_id = $2 AND host_id = (SELECT host_id FROM listings WHERE id = $2) FOR UPDATE`,
+      [input.offerCode, l.id],
+    )).rows[0];
+    if (!offer || offer.status !== 'open' || new Date(offer.expires_at).getTime() <= Date.now()) throw new BookingError('This payment link is no longer available');
+    if (offer.check_in !== input.checkIn || offer.check_out !== input.checkOut || offer.guests !== input.guests) throw new BookingError('The booking details do not match this payment link');
+  }
+  if (!(await isAvailable(db, l.id, input.checkIn, input.checkOut, input.offerCode))) throw new BookingError('Those dates are already booked');
 
-  const q = quote(l, nights);
+  const currentQuote = quote(l, nights);
+  const q = offer ? {
+    ...currentQuote,
+    nightly: offer.nightly_mxn,
+    cleaning: offer.cleaning_mxn,
+    subtotal: offer.subtotal_mxn,
+    fee: offer.fee_mxn,
+    deposit: offer.deposit_mxn,
+    total: offer.total_mxn,
+  } : currentQuote;
   const fx = await usdcMxnRate();
   const token = { amount: toToken(q.subtotal, fx.rate), fee: toToken(q.fee, fx.rate), deposit: toToken(q.deposit, fx.rate) };
-  const tiers = chainTiers(l.policy);
+  const policy = offer?.policy ?? l.policy;
+  const tiers = offer?.tiers ?? chainTiers(policy);
   const reference = await nextReference(db);
   const terms = JSON.stringify({ reference, listing: l.slug, guest: guest.stellar_address, host: l.host_address, ...input, quote: q, token, fx: fx.rate, salt: randomBytes(16).toString('hex') });
   const escrowId = createHash('sha256').update(terms).digest('hex');
@@ -74,9 +106,13 @@ export async function createBooking(db: Db, input: { listingId: number; guestId:
        deposit_mxn, total_mxn, fx_rate, amount_token, fee_token, deposit_token, policy, tiers, escrow_id, chain_check_in, chain_stay_paid_at, chain_deadline, status)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'locked') RETURNING id`,
     [reference, l.id, guest.id, input.checkIn, input.checkOut, nights, input.guests, q.nightly, q.cleaning, q.subtotal, q.fee, q.deposit, q.total,
-      fx.rate, token.amount, token.fee, token.deposit, l.policy, JSON.stringify(tiers), escrowId, times.checkInSec, times.stayPaidAtSec, times.deadlineSec],
+      fx.rate, token.amount, token.fee, token.deposit, policy, JSON.stringify(tiers), escrowId, times.checkInSec, times.stayPaidAtSec, times.deadlineSec],
   )).rows[0]!;
   await event(db, row.id, 'locked', 'guest', res.hash, { totalToken: new Big(token.amount).plus(token.fee).plus(token.deposit).toFixed(5) });
+  if (offer) {
+    const updated = await db.query(`UPDATE rental_offers SET status = 'used', booking_id = $1 WHERE code = $2 AND status = 'open' RETURNING code`, [row.id, offer.code]);
+    if (updated.rows.length !== 1) throw new BookingError('This payment link is no longer available');
+  }
   return { id: row.id, reference, txHash: res.hash, explorer: explorerTx(res.hash) };
 }
 

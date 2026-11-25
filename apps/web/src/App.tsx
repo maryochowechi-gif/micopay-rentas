@@ -9,6 +9,7 @@ import Trips from './pages/Trips';
 import BookingPage from './pages/BookingPage';
 import Hosting from './pages/Hosting';
 import Disputes from './pages/Disputes';
+import OfferPage from './pages/OfferPage';
 
 const KEY = 'rentas.persona';
 const read = () => { try { return localStorage.getItem(KEY); } catch { return null; } };
@@ -77,6 +78,7 @@ export default function App() {
             <Route path="/stay/:slug" element={<ListingPage />} />
             <Route path="/trips" element={<Trips />} />
             <Route path="/bookings/:id" element={<BookingPage onChange={reloadUsers} />} />
+            <Route path="/r/:code" element={<OfferPage />} />
             <Route path="/hosting" element={<Hosting />} />
             <Route path="/disputes" element={<Disputes />} />
           </Routes>
